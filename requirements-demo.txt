@@ -1,0 +1,11 @@
+# Reuse the existing PyTorch/CUDA environment; no training or weight downloads.
+torch>=2.6
+torchvision>=0.21
+numpy>=1.24
+opencv-python>=4.8
+PyYAML>=6
+Pillow>=10
+matplotlib>=3.7
+av==16.1.0
+ultralytics==8.4.190
+lap==0.5.13

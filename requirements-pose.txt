@@ -1,0 +1,2 @@
+# Existing environment already contains numpy, opencv-python, torch and ultralytics.
+mediapipe==0.10.31

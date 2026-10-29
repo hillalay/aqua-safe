@@ -1,0 +1,11 @@
+metadata: results/single_metadata.csv
+output_dir: results/r3d18_pilot
+seed: 42
+epochs: 5
+batch_size: 2
+learning_rate: 0.0001
+clip_length: 16
+sampling_fps: 8.0
+stride: 16
+early_stopping_patience: 2
+freeze_backbone: true

@@ -1,0 +1,36 @@
+master_metadata: results/video_review/master_metadata.csv
+review_state: results/video_review/review_state.json
+similarity_candidates: results/video_review/similarity_candidates.csv
+output_dir: results/r3d18_binary_drowning
+binary_metadata: results/r3d18_binary_drowning/binary_metadata.csv
+mil_output_dir: results/r3d18_binary_drowning/mil
+model: torchvision.models.video.r3d_18
+pretrained: true
+classes: [normal_swimming, drowning_behavior]
+cv_folds: 5
+seed: 42
+clip_length: 16
+sampling_fps: 8.0
+input_size: [112, 112]
+freeze_backbone: true
+device: cuda
+epochs: 5
+bag_batch_size: 1
+max_clips_per_train_bag: 8
+max_clips_per_validation_bag: 32
+clip_forward_batch_size: 4
+clip_stride: 16
+top_k: 2
+learning_rate: 0.0001
+weight_decay: 0.01
+num_workers: 0
+training_strategy:
+  name: multiple_instance_learning
+  bag: video
+  pooling: top_k_mean_clip_logits
+  negative_bag_aggregation: top-k mean; penalize the highest drowning scores in normal videos
+  train_clip_sampling: deterministic seeded random sample, resampled each epoch
+  validation_clip_sampling: deterministic evenly spaced sample
+  supervision: weak_video_label
+  positive_clip_labels: false
+  note: Train the two-output head from video bags; do not copy a drowning candidate label to every clip.
