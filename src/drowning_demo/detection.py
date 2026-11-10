@@ -4,17 +4,21 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.trackers.bot_sort import BOTSORT
 from ultralytics.utils import YAML
 from ultralytics.utils.checks import check_yaml
 
 from src.drowning_demo.analysis import decoded_frames
 
 
-def make_tracker(new_track_threshold=0.25):
-    settings = YAML.load(check_yaml('bytetrack.yaml'))
+def make_tracker(new_track_threshold=0.25, algorithm='bytetrack'):
+    if algorithm not in {'bytetrack', 'botsort'}:
+        raise ValueError('Unknown tracker: ' + algorithm)
+    settings = YAML.load(check_yaml(algorithm + '.yaml'))
     settings['new_track_thresh'] = new_track_threshold
     settings['track_high_thresh'] = new_track_threshold
-    return BYTETracker(SimpleNamespace(**settings))
+    tracker = BYTETracker if algorithm == 'bytetrack' else BOTSORT
+    return tracker(SimpleNamespace(**settings))
 
 
 def attach_tracks(boxes, tracker, image=None):

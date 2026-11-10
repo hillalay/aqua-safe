@@ -147,3 +147,32 @@ Hazırlama kesilirse `prepare-new --resume` kayıtlı tespit kararlarını ve me
 MP4 kare/zaman bilgilerini doğrulayarak kalan kaynakları tamamlar. Tamamlanmış
 CSV veya manifest bulunan veri setini tekrar işlemeyi reddeder; incelenmiş
 etiketler ve önceki çıktılar üzerine yazılmaz.
+
+### Mevcut R3D-18 ile deneysel kişi görselleştirmesi
+
+```powershell
+# Önce en kısa validation videosunda iki takipçiyi karşılaştırır.
+.\.venv\Scripts\python.exe -m src.video_classification.visualize_person_r3d18 --output results/person_tracking_pilot
+# Pilotun görüntüsünü kontrol ettikten sonra tüm validation videoları:
+.\.venv\Scripts\python.exe -m src.video_classification.visualize_person_r3d18 --all-videos --threshold 0.30 --output results/person_tracking_comparison
+```
+
+Çıktı klasörü yeni olmalıdır; eski deneylerin üzerine yazılmaz. `--video-id` tek
+validation videosunu seçer. YOLOv8s her karede çalışır (confidence 0,10, giriş 960
+piksel); aynı tespitler ByteTrack ve BoT-SORT'a verilir.
+BoT-SORT mevcut sparseOptFlow ayarını kullanır, ReID kapalıdır.
+
+Tespit kutuları analizden bağımsız çizilir. ID onaysızsa, görüntü yetersizse veya
+16 gerçek örnek henüz oluşmamışsa `ANALİZ BEKLENİYOR` görünür. Yaklaşık 8 Hz ile
+16 örnek toplanır; sonraki analizler 8 örnekte bir yapılır. Her takip boşluğu,
+belirgin kutu sıçraması veya komşu kişi karışması analiz geçmişini sıfırlar.
+Skor pencere tamamlanınca görünür ve en fazla 8 örnek aralığı geçerlidir.
+YOLO confidence ve R3D boğulma skoru ayrı gösterilir. Varsayılan eşik 0,30'dur.
+
+`report.json` kutulu kare oranını, kesintisiz ID dizilerini, aynı ID'nin boşluk
+sonrası dönüşlerini ve gerçek skorlanan kişi pencerelerini içerir. Kayan pencereler
+örtüşebilir; sayıları eski 209 sabit klibin kapsamasıyla doğrudan karşılaştırılmaz.
+`original_grid_*` alanları yalnızca eski örnekleme düzenindeki aynı-ID adaylarıdır.
+Kutu oranı kişi recall'ı değildir; kimlik ground truth'u olmadan ID switch doğruluğu
+bilinmez. Kaynak AVI'lerdeki eski çizimler kalabilir. Model kişi kırpmalarıyla
+eğitilmemiştir; skorlar deneysel ve kalibre edilmemiştir. Eğitim başlatılmaz.

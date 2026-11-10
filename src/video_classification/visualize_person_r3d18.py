@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from bisect import bisect_right
 from fractions import Fraction
 import json
 import math
@@ -15,13 +16,12 @@ from tqdm.auto import tqdm
 from ultralytics import YOLO
 
 from src.drowning_demo.analysis import decoded_frames, overlay_font
-from src.drowning_demo.detection import make_tracker, attach_tracks
+from src.drowning_demo.detection import make_tracker, attach_tracks, detection_gaps
 from src.drowning_demo.swimmers import crop_person, score_clip
 from src.video_review.inventory import sha256_file
 from .model import build_r3d18
 from .preprocessing import probe_video
-from .prepare_binary_v1 import write_csv
-from .visualize_yolo_r3d18 import prediction_at_frame, verify_render
+from .visualize_yolo_r3d18 import verify_render
 from .yolo_dataset import YoloClipDataset, annotated_path
 
 
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LIMITATIONS = [
     'The checkpoint was trained on annotated full-scene clips, not person crops. Crop scores are experimental; person-level accuracy/recall and calibration are unknown.',
     'Parent-video labels are weak labels, not verified person/event truth. No person-level recall is claimed.',
-    'ByteTrack IDs are temporary tracking IDs, not verified human identities; switches and missed detections remain possible.',
+    'Tracker IDs are temporary tracking IDs, not verified human identities; switches and missed detections remain possible.',
     'Detections are rerun on annotated AVI inputs; old YOLO drawings may remain visible. No source file is changed.',
     'A score requires the same confirmed track ID in all 16 real sampled frames. Detection gaps between sampled frames are accepted by user choice; no box interpolation, sample padding, or score extrapolation is used.',
     'Existing crop_person preprocessing uses 1.3x square context and the existing R3D normalization. Nearby people may enter that context.',
@@ -63,24 +63,7 @@ def person_clip_plan(clips, frames):
     return plans, skipped
 
 
-def detect_people(source, info, detector):
-    tracker, frames = make_tracker(), []
-    for frame in tqdm(decoded_frames(source), total=info.frame_count,
-                      desc='YOLO+ByteTrack ' + source.stem, unit='frame', mininterval=1):
-        image = frame.to_ndarray(format='bgr24')
-        result = detector.predict(image, classes=[0], conf=0.15, imgsz=640,
-                                  device='cuda', verbose=False)[0]
-        people = attach_tracks(result.boxes, tracker, image)
-        ids = [p['track_id'] for p in people if p['track_id'] is not None]
-        if len(ids) != len(set(ids)):
-            raise ValueError('Tracker assigned the same ID to multiple detections in one frame')
-        frames.append(people)
-    if len(frames) != info.frame_count:
-        raise ValueError('Source/detection frame count mismatch')
-    return frames
-
-
-def score_people(source, frames, plans, model):
+def score_people(source, frames, plans, model, device='cuda'):
     if not plans:
         return []
     scheduled, samples, result = defaultdict(list), defaultdict(list), []
@@ -97,7 +80,7 @@ def score_people(source, frames, plans, model):
             key = plan['person_clip_id']
             samples[key].append(crop_person(rgb, by_track[plan['track_id']]['box']))
             if index == plan['end_frame']:
-                probability, padded = score_clip(model, samples.pop(key), 'cuda')
+                probability, padded = score_clip(model, samples.pop(key), device)
                 if probability is None or padded or not math.isfinite(probability):
                     raise ValueError('A person score requires 16 real samples, no padding')
                 result.append({**{k: v for k, v in plan.items() if k != 'sample_frame_indices'},
@@ -110,12 +93,26 @@ def score_people(source, frames, plans, model):
 
 def person_text(person, prediction, threshold):
     identity = f"#{person['track_id']}" if person['track_id'] is not None else '#?'
+    confidence = person.get('confidence')
+    detection = f"YOLO: %{confidence * 100:.1f}" if confidence is not None else 'YOLO: bilinmiyor'
     if prediction is None:
-        return f'{identity} Skor yok | 16 gerçek takip örneği yok', '#FFC857'
+        return f'{identity} ANALİZ BEKLENİYOR | {detection}', '#FFC857'
     probability = float(prediction['drowning_probability'])
     high = probability >= threshold
-    label = 'Boğulma riski (deneysel)' if high else 'Normal yüzücü (model)'
-    return f'{identity} {label} | P(boğulma sınıfı): %{probability * 100:.1f}', '#FF4444' if high else '#30EF90'
+    label = 'BOĞULMA UYARISI (deneysel)' if high else 'NORMAL YÜZÜCÜ (model)'
+    return (f'{identity} {label}\nR3D boğulma skoru: %{probability * 100:.1f} | {detection}',
+            '#FF4444' if high else '#30EF90')
+
+
+def completed_prediction(rows, ends, index, person):
+    position = bisect_right(ends, index) - 1
+    if position < 0:
+        return None
+    row = rows[position]
+    if (index > row['display_end_frame']
+            or person.get('analysis_segment') != row['analysis_segment']):
+        return None
+    return row
 
 
 def render_people(root, clips, frames, predictions, destination, threshold):
@@ -128,8 +125,8 @@ def render_people(root, clips, frames, predictions, destination, threshold):
         tracks[prediction['track_id']].append(prediction)
     lookups = {}
     for track, rows in tracks.items():
-        rows.sort(key=lambda r: r['start_frame'])
-        lookups[track] = (rows, [r['start_frame'] for r in rows])
+        rows.sort(key=lambda r: r['end_frame'])
+        lookups[track] = (rows, [r['end_frame'] for r in rows])
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix('.partial.mp4')
     if partial.exists():
@@ -150,16 +147,16 @@ def render_people(root, clips, frames, predictions, destination, threshold):
                       font=font, fill='white')
             for person in frames[index]:
                 rows, starts = lookups.get(person['track_id'], ([], []))
-                prediction = prediction_at_frame(rows, starts, index)
+                prediction = completed_prediction(rows, starts, index, person)
                 text, color = person_text(person, prediction, threshold)
                 x1, y1, x2, y2 = person['box']
                 draw.rectangle((x1, y1, x2, y2), outline=color, width=4)
-                bounds = draw.textbbox((0, 0), text, font=font)
+                bounds = draw.multiline_textbbox((0, 0), text, font=font)
                 width, height = bounds[2] - bounds[0] + 10, bounds[3] - bounds[1] + 14
                 left = max(0, min(x1, info.width - width))
                 top = max(44, y1 - height)
                 draw.rectangle((left, top, left + width, top + height), fill='#101923')
-                draw.text((left + 4, top + 1), text, font=font, fill=color)
+                draw.multiline_text((left + 4, top + 1), text, font=font, fill=color)
             footer = 'Kişi kırpması bu checkpoint için doğrulanmadı; skor kalibre edilmiş gerçek risk değildir.'
             draw.rectangle((0, info.height - 44, info.width, info.height), fill='#101923')
             draw.text((8, info.height - 40), footer, font=font, fill='#FFC857')
@@ -178,112 +175,229 @@ def render_people(root, clips, frames, predictions, destination, threshold):
     return verified
 
 
-def run(threshold, root=ROOT):
+def overlap_fraction(a, b):
+    intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    area = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return intersection / area if area > 0 else 0
+
+
+def rolling_person_plan(clips, frames, fps):
+    """Keep IDs for display, but reset analysis on gaps or observable ambiguity."""
+    # shortcut: geometry cannot detect every ID swap or bad image; validate with person/quality labels before accuracy claims.
+    step = max(1, round(fps / 8))
+    active, plans, rejected = {}, [], defaultdict(int)
+    segment = 0
+    for index, people in enumerate(frames):
+        current = {}
+        for person in people:
+            person['analysis_segment'] = None
+            track, box = person['track_id'], person['box']
+            if track is None:
+                rejected['unconfirmed_id'] += 1
+                continue
+            if (person['confidence'] < 0.15 or box[2] - box[0] < 16 or box[3] - box[1] < 16
+                    or not all(math.isfinite(x) for x in box)):
+                rejected['insufficient_image'] += 1
+                continue
+            # Context crops are 1.3x squares: reject neighbours inside that context too.
+            side = max(box[2] - box[0], box[3] - box[1]) * 1.3
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            context = [cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2]
+            if any(other is not person and overlap_fraction(context, other['box']) > 0.25 for other in people):
+                rejected['ambiguous_neighbour'] += 1
+                continue
+            previous = active.get(track)
+            if previous and overlap_fraction(previous['box'], box) < 0.1:
+                rejected['abrupt_box_jump'] += 1
+                previous = None
+            if previous is None:
+                segment += 1
+                previous = {'segment': segment, 'indices': [], 'first': index, 'count': 0}
+            state = previous
+            state['box'] = box
+            person['analysis_segment'] = state['segment']
+            current[track] = state
+            if (index - state['first']) % step:
+                continue
+            state['indices'] = (state['indices'] + [index])[-16:]
+            state['count'] += 1
+            if len(state['indices']) != 16 or (state['count'] - 16) % 8:
+                continue
+            start = state['indices'][0]
+            parent = next((c for c in clips if int(c['start_frame']) <= index <= int(c['end_frame'])), clips[0])
+            parent_id = parent['clip_id'] if int(parent['start_frame']) <= index <= int(parent['end_frame']) else None
+            plans.append({
+                'person_clip_id': f"{parent['video_id']}_S{state['segment']}_F{index}",
+                'parent_clip_id': parent_id, 'video_id': parent['video_id'],
+                'source_path': parent['source_path'], 'track_id': track,
+                'analysis_segment': state['segment'], 'start_frame': start, 'end_frame': index,
+                'display_end_frame': index + 8 * step - 1, 'frame_step': step,
+                'start_time': start / fps, 'end_time': index / fps,
+                'sample_frame_indices': list(state['indices']),
+                'parent_video_label': int(parent['video_label']), 'person_event_label': 'unknown',
+                'label_strength': 'weak_video_label', 'draft_split': parent['draft_split'],
+                'leakage_group': parent['leakage_group'],
+            })
+        active = current
+    return plans, dict(rejected)
+
+
+def tracking_metrics(frames):
+    stats = detection_gaps(frames)
+    occurrences = defaultdict(list)
+    for index, people in enumerate(frames):
+        for person in people:
+            if person['track_id'] is not None:
+                occurrences[person['track_id']].append(index)
+    runs, gaps = [], []
+    for indices in occurrences.values():
+        length = 1
+        for previous, index in zip(indices, indices[1:]):
+            if index == previous + 1:
+                length += 1
+            else:
+                runs.append(length)
+                gaps.append(index - previous - 1)
+                length = 1
+        runs.append(length)
+    stats.update({
+        'frames_with_boxes_ratio': stats['frames_with_boxes'] / len(frames) if frames else 0,
+        'detected_boxes': sum(map(len, frames)),
+        'confirmed_track_ids': len(occurrences), 'continuous_track_runs': len(runs),
+        'same_id_reappearance_gaps': gaps, 'same_id_breaks': len(gaps),
+        'continuous_run_lengths': runs,
+        'id_switches': 'unknown_without_person_identity_ground_truth',
+        'person_box_recall': 'unknown_without_person_box_ground_truth',
+    })
+    return stats
+
+
+def detect_comparison(source, info, detector, device, confidence, imgsz):
+    trackers = {name: make_tracker(algorithm=name)
+                for name in ('bytetrack', 'botsort')}
+    frames = {name: [] for name in trackers}
+    for frame in tqdm(decoded_frames(source), total=info.frame_count, desc='YOLO + paired trackers'):
+        image = frame.to_ndarray(format='bgr24')
+        boxes = detector.predict(image, classes=[0], conf=confidence, imgsz=imgsz,
+                                 device=device, verbose=False)[0].boxes
+        for name, tracker in trackers.items():
+            people = attach_tracks(boxes, tracker, image)
+            ids = [p['track_id'] for p in people if p['track_id'] is not None]
+            if len(ids) != len(set(ids)):
+                raise ValueError('Duplicate track ID in a frame')
+            frames[name].append(people)
+    if any(len(value) != info.frame_count for value in frames.values()):
+        raise ValueError('Detection frame count mismatch')
+    return frames
+
+
+def baseline_report(root, clips):
+    base = root / 'results/aquasafe_yolo_r3d18_v1/visualization'
+    key = Path(clips[0]['source_path']).stem + '_' + clips[0]['video_id'][-12:] + '.json'
+    paths = [base / name / 'detections' / key for name in ('person_level_t030_sampled16', 'person_level_t030')]
+    cache = next((path for path in paths if path.exists()), None)
+    if cache is None:
+        return None
+    stored = json.loads(cache.read_text(encoding='utf-8'))
+    if stored['source_sha256'] != clips[0]['yolo_sha256']:
+        raise ValueError('Baseline source hash mismatch')
+    frames = stored['frames']
+    plans, _ = person_clip_plan(clips, frames)
+    all_detected = all_confirmed = 0
+    for clip in clips:
+        indices = range(int(clip['start_frame']), int(clip['end_frame']) + 1, int(clip['frame_step']))
+        all_detected += all(frames[i] for i in indices)
+        all_confirmed += all(any(p['track_id'] is not None for p in frames[i]) for i in indices)
+    return {**tracking_metrics(frames), 'parent_clips': len(clips),
+            'parents_all_16_detected': all_detected, 'parents_all_16_confirmed': all_confirmed,
+            'parents_same_id_16': len({p['parent_clip_id'] for p in plans}),
+            'valid_person_clips': len(plans)}
+
+
+def run(threshold=0.30, root=ROOT, *, output=None, video_id=None, all_videos=False):
     if not math.isfinite(threshold) or not 0 < threshold < 1:
         raise ValueError('Threshold must be strictly between zero and one')
     root = Path(root).resolve()
     base = root / 'results/aquasafe_yolo_r3d18_v1'
-    output = base / 'visualization/person_level_t030_sampled16'
-    legacy = base / 'visualization/person_level_t030'
-    checkpoint, weight = base / 'training/best_model.pt', root / 'yolov8n.pt'
-    if threshold != 0.30:
-        raise ValueError('This experiment was explicitly configured for the user-selected threshold 0.30')
-    if not torch.cuda.is_available():
-        raise RuntimeError('CUDA is required for person detection and crop inference')
+    output = Path(output).resolve() if output else root / 'results/person_tracking_comparison'
+    output.mkdir(parents=True, exist_ok=False)
+    checkpoint = base / 'training/best_model.pt'
+    weight = root / 'yolov8s.pt'
+    confidence, imgsz = 0.10, 960
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dataset = YoloClipDataset(root, base / 'clip_manifest.csv', split='validation')
     grouped = defaultdict(list)
     for row in dataset.rows:
         grouped[row['video_id']].append(row)
-    protected = [checkpoint, weight, base / 'clip_manifest.csv', base / 'training/history.json',
-                 root / 'src/video_classification/train_yolo_r3d18.py',
-                 root / 'src/video_classification/model.py', root / 'src/video_classification/preprocessing.py',
-                 Path(__file__).resolve(), root / 'src/drowning_demo/detection.py',
-                 root / 'src/drowning_demo/swimmers.py']
-    hashes = {str(p.relative_to(root)): sha256_file(p) for p in protected}
-    provenance = {'input_sha256': hashes, 'threshold': threshold, 'detector': 'yolov8n',
-                  'confidence': 0.15, 'imgsz': 640, 'tracker': 'existing make_tracker() ByteTrack defaults',
-                  'crop': 'existing crop_person: 1.3x square context, existing transform_clip',
-                  'clip_policy': 'User-approved: same confirmed ID in all 16 real sampled frames of the existing parent clip; unsampled-frame detection gaps accepted.'}
-    output.mkdir(parents=True, exist_ok=True)
-    config = output / 'config.json'
-    if config.exists():
-        if json.loads(config.read_text(encoding='utf-8')) != provenance:
-            raise ValueError('Existing person experiment has different inputs/config; refusing to reuse it')
-    else:
-        config.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
-    if (legacy / 'config.json').exists():
-        old = json.loads((legacy / 'config.json').read_text(encoding='utf-8'))
-        if (any(old[k] != provenance[k] for k in ('detector', 'confidence', 'imgsz', 'tracker'))
-                or old['input_sha256']['yolov8n.pt'] != hashes['yolov8n.pt']):
-            raise ValueError('Existing detection settings differ; refusing to reuse coordinates')
-    (output / 'detections').mkdir(exist_ok=True)
-    (output / 'scores').mkdir(exist_ok=True)
+    baseline = {key: baseline_report(root, clips) for key, clips in grouped.items()}
+    if video_id:
+        grouped = {key: clips for key, clips in grouped.items() if key == video_id}
+        if not grouped:
+            raise ValueError('Unknown validation video ID')
+    elif not all_videos:
+        grouped = dict(sorted(grouped.items(), key=lambda item: int(item[1][0]['source_frame_count']))[:1])
+    protected = [checkpoint, weight, base / 'clip_manifest.csv', base / 'training/history.json']
+    protected += [p for p in (root / 'results').glob('aquasafe_yolo_r3d18_v*/training/*')
+                  if p.is_file() and p.suffix in {'.pt', '.json', '.csv'} and p not in protected]
+    protected += [root / clips[0]['source_path'] for clips in grouped.values()]
+    hashes = {str(p): sha256_file(p) for p in protected}
+    limitations = LIMITATIONS[:4] + [LIMITATIONS[-1],
+        'Both trackers receive identical detections on every frame. BoT-SORT uses installed defaults: sparseOptFlow GMC, ReID disabled.',
+        'Analysis resets after any missing/invalid/ambiguous frame. 16 real samples at approximately 8 Hz, rolling stride 8 samples. Scores appear only after completion and expire after 8 sample intervals or a segment change.',
+        'Geometry/confidence/overlap checks reject observable ambiguity; undetected identity switches and bad images remain possible. IDs are not verified identities.',
+        'Box-frame ratio is frames with at least one detection divided by all frames; it is not person recall. Gaps and run lengths are tracking proxies, not IDF1/HOTA.',
+        'New rolling windows overlap; report their count separately from coverage of the original 209 parent clips.',
+        'Detector changed from yolov8n/640/conf=0.15 to configured settings; detection changes cannot be attributed to tracker choice.',
+    ]
+    config = {'threshold': threshold, 'detector': str(weight), 'confidence': confidence,
+              'imgsz': imgsz, 'device': device, 'input_sha256': hashes,
+              'trackers': ['bytetrack', 'botsort'], 'limitations': limitations}
+    (output / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
     detector = YOLO(str(weight))
-    model = build_r3d18(2, pretrained=False).to('cuda')
+    model = build_r3d18(2, pretrained=False).to(device)
     model.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True), strict=True)
     model.eval()
-    all_predictions, summaries = [], []
-    for video_id, clips in tqdm(grouped.items(), desc='Person validation videos', unit='video'):
+    report = {'baseline': baseline, 'videos': [], 'limitations': limitations, 'threshold': threshold,
+              'training_started': False, 'complete': False}
+    for key, clips in grouped.items():
         source, _ = annotated_path(root, clips[0]['source_path'])
-        source_hash = sha256_file(source)
-        if source_hash != clips[0]['yolo_sha256']:
-            raise ValueError('Source AVI changed: ' + str(source))
+        if sha256_file(source) != clips[0]['yolo_sha256']:
+            raise ValueError('Source hash mismatch')
         info = probe_video(source)
-        key = source.stem + '_' + video_id[-12:]
-        cache = output / 'detections' / (key + '.json')
-        if not cache.exists() and (legacy / 'detections' / cache.name).exists():
-            cache = legacy / 'detections' / cache.name
-        if cache.exists():
-            stored = json.loads(cache.read_text(encoding='utf-8'))
-            if stored['source_sha256'] != source_hash:
-                raise ValueError('Detection cache source mismatch')
-            frames = stored['frames']
-        else:
-            frames = detect_people(source, info, detector)
-            with cache.open('x', encoding='utf-8') as target:
-                json.dump({'source_path': clips[0]['source_path'], 'source_sha256': source_hash,
-                           'fps': info.fps, 'frame_count': info.frame_count, 'frames': frames}, target)
-        plans, skipped = person_clip_plan(clips, frames)
-        score_path = output / 'scores' / (key + '.json')
-        if score_path.exists():
-            predictions = json.loads(score_path.read_text(encoding='utf-8'))
-            if {r['person_clip_id'] for r in predictions} != {r['person_clip_id'] for r in plans}:
-                raise ValueError('Person score cache does not match current track plan')
-        else:
-            predictions = score_people(source, frames, plans, model)
-            with score_path.open('x', encoding='utf-8') as target:
-                json.dump(predictions, target, ensure_ascii=False, indent=2)
-        all_predictions.extend(predictions)
-        name = ('drowning_' if int(clips[0]['video_label']) else 'normal_') + source.stem + '.mp4'
-        exported = render_people(root, clips, frames, predictions, output / 'videos' / name, threshold)
-        if sha256_file(source) != source_hash:
-            raise ValueError('Source changed during analysis')
-        summaries.append({**exported, 'detected_person_boxes': sum(map(len, frames)),
-                          'detection_cache': str(cache),
-                          'confirmed_track_ids': len({p['track_id'] for f in frames for p in f if p['track_id'] is not None}),
-                          'scored_person_clips': len(predictions), 'skipped_parent_clips': skipped})
-        report = {'complete': len(summaries) == len(grouped), 'videos': summaries,
-                  'expected_videos': len(grouped), 'scored_person_clips': len(all_predictions),
-                  'threshold': threshold, 'person_level_recall': 'unknown',
-                  'checkpoint_crop_suitability': 'Architecture compatible; domain suitability unverified',
-                  'limitations': LIMITATIONS, 'training_started': False}
-        (output / 'person_report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-    csv_path = output / 'person_predictions.csv'
-    if not csv_path.exists() and all_predictions:
-        write_csv(csv_path, all_predictions, list(all_predictions[0]))
-    if hashes != {str(p.relative_to(root)): sha256_file(p) for p in protected}:
-        raise RuntimeError('A protected input changed while person analysis was running')
-    report['protected_inputs_unchanged'] = True
-    (output / 'person_report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(json.dumps({'videos': len(summaries), 'person_clips': len(all_predictions), 'output': str(output)}, indent=2))
+        paired = detect_comparison(source, info, detector, device, confidence, imgsz)
+        summary = {'video_id': key, 'source_path': clips[0]['source_path'], 'trackers': {}}
+        for name, frames in paired.items():
+            destination = output / key / name
+            destination.mkdir(parents=True)
+            fixed, _ = person_clip_plan(clips, frames)
+            plans, rejected = rolling_person_plan(clips, frames, info.fps)
+            predictions = score_people(source, frames, plans, model, device=device)
+            (destination / 'detections.json').write_text(json.dumps(frames), encoding='utf-8')
+            (destination / 'scores.json').write_text(json.dumps(predictions, indent=2), encoding='utf-8')
+            exported = render_people(root, clips, frames, predictions, destination / 'overlay.mp4', threshold)
+            summary['trackers'][name] = {**tracking_metrics(frames), **exported,
+                'original_grid_same_id_candidates': len(fixed),
+                'original_grid_parents_with_same_id_candidate': len({p['parent_clip_id'] for p in fixed}),
+                'valid_person_classification_clips': len(predictions),
+                'parents_with_completed_rolling_score': len({p['parent_clip_id'] for p in predictions
+                                                           if p['parent_clip_id'] is not None}),
+                'rejected_detection_frames': rejected}
+        report['videos'].append(summary)
+        (output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    if hashes != {str(p): sha256_file(p) for p in protected}:
+        raise RuntimeError('Protected inputs changed during analysis')
+    report.update(complete=True, protected_inputs_unchanged=True)
+    (output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    print(json.dumps({'output': str(output), 'videos': len(report['videos'])}))
     return report
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--threshold', type=float, required=True)
+    parser.add_argument('--threshold', type=float, default=0.30)
+    parser.add_argument('--output', type=Path)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--video-id')
+    selection.add_argument('--all-videos', action='store_true')
     args = parser.parse_args()
-    try:
-        run(args.threshold)
-    except Exception as error:
-        raise SystemExit(f'Person analysis failed: {error}. Existing sources/checkpoints are not overwritten.') from error
+    run(args.threshold, output=args.output, video_id=args.video_id, all_videos=args.all_videos)

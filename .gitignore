@@ -3,3 +3,5 @@ raw
 results
 single
 test_videos
+__pycache__/
+*.py[cod]
